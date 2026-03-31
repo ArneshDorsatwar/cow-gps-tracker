@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cow GPS Tracker Dashboard</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 320px 1fr 300px;
+            grid-template-rows: 60px 1fr;
+            height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            grid-column: 1 / -1;
+            background: #1e293b;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            gap: 20px;
+            border-bottom: 1px solid #334155;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .header h1 span { color: #22c55e; }
+        .header .status {
+            margin-left: auto;
+            display: flex; gap: 16px; font-size: 13px; color: #94a3b8;
+        }
+        .header .status .live { color: #22c55e; }
+        .header .status .dot {
+            display: inline-block; width: 8px; height: 8px;
+            background: #22c55e; border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+        /* Sidebar - Cow List */
+        .sidebar {
+            background: #1e293b;
+            border-right: 1px solid #334155;
+            overflow-y: auto;
+            padding: 12px;
+        }
+        .sidebar h2 { font-size: 14px; color: #94a3b8; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
+
+        .cow-card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .cow-card:hover { border-color: #22c55e; }
+        .cow-card.selected { border-color: #22c55e; background: #1a2332; }
+        .cow-card .cow-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .cow-card .cow-id { font-weight: 600; font-size: 15px; }
+        .cow-card .cow-sats { font-size: 11px; color: #64748b; margin-left: auto; }
+
+        .behavior-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .behavior-RESTING { background: #1e3a5f; color: #60a5fa; }
+        .behavior-GRAZING { background: #14532d; color: #4ade80; }
+        .behavior-WALKING { background: #422006; color: #fb923c; }
+        .behavior-RUNNING { background: #450a0a; color: #f87171; }
+
+        .cow-card .cow-coords { font-size: 12px; color: #64748b; margin-top: 4px; font-family: monospace; }
+        .cow-card .cow-speed { font-size: 12px; color: #94a3b8; }
+
+        /* Map */
+        .map-container { position: relative; }
+        #map { width: 100%; height: 100%; }
+
+        /* Right Panel - Alerts & Details */
+        .right-panel {
+            background: #1e293b;
+            border-left: 1px solid #334155;
+            overflow-y: auto;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .panel-section h2 {
+            font-size: 13px; color: #94a3b8;
+            text-transform: uppercase; letter-spacing: 1px;
+            margin-bottom: 8px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #334155;
+        }
+
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .stat-card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 10px;
+            text-align: center;
+        }
+        .stat-card .value { font-size: 22px; font-weight: 700; color: #22c55e; }
+        .stat-card .label { font-size: 11px; color: #64748b; margin-top: 2px; }
+
+        /* Alerts */
+        .alert-item {
+            background: #0f172a;
+            border-left: 3px solid #f87171;
+            border-radius: 0 6px 6px 0;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+        .alert-item.geofence { border-left-color: #f59e0b; }
+        .alert-item.behavior { border-left-color: #f87171; }
+        .alert-item .alert-time { color: #64748b; font-size: 10px; }
+        .alert-item .alert-msg { color: #e2e8f0; margin-top: 2px; }
+
+        /* Geofence controls */
+        .geofence-controls label { font-size: 12px; color: #94a3b8; display: block; margin-top: 6px; }
+        .geofence-controls input[type="number"] {
+            width: 100%; background: #0f172a; border: 1px solid #334155;
+            color: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 13px;
+        }
+        .geofence-controls .toggle {
+            display: flex; align-items: center; gap: 8px; margin-top: 8px;
+        }
+        .btn {
+            background: #22c55e; color: #0f172a; border: none;
+            padding: 6px 14px; border-radius: 4px; cursor: pointer;
+            font-weight: 600; font-size: 12px; margin-top: 8px;
+        }
+        .btn:hover { background: #16a34a; }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <!-- Header -->
+        <div class="header">
+            <h1><span>&#x1F42E;</span> Cow GPS Tracker</h1>
+            <div class="status">
+                <span><span class="dot"></span> <span class="live">LIVE</span></span>
+                <span id="cow-count">0 cows</span>
+                <span id="clock"></span>
+            </div>
+        </div>
+
+        <!-- Sidebar: Cow List -->
+        <div class="sidebar">
+            <h2>Herd</h2>
+            <div id="cow-list"></div>
+        </div>
+
+        <!-- Map -->
+        <div class="map-container">
+            <div id="map"></div>
+        </div>
+
+        <!-- Right Panel -->
+        <div class="right-panel">
+            <div class="panel-section">
+                <h2>Overview</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="value" id="stat-total">0</div>
+                        <div class="label">Total Cows</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="stat-moving">0</div>
+                        <div class="label">Moving</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="stat-resting">0</div>
+                        <div class="label">Resting</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="stat-alerts">0</div>
+                        <div class="label">Alerts</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <h2>Geofence</h2>
+                <div class="geofence-controls">
+                    <label>Radius (meters)</label>
+                    <input type="number" id="geo-radius" value="500" min="50" max="10000">
+                    <div class="toggle">
+                        <input type="checkbox" id="geo-enabled" checked>
+                        <label for="geo-enabled" style="margin:0">Enabled</label>
+                    </div>
+                    <button class="btn" onclick="updateGeofence()">Update Geofence</button>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <h2>Alerts</h2>
+                <div id="alerts-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ── Map Setup ──
+        const map = L.map('map').setView([33.7199, -112.1065], 16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+
+        // ── State ──
+        const cowMarkers = {};
+        const cowTrails = {};
+        let geofenceCircle = null;
+        let selectedCow = null;
+        let alertCount = 0;
+
+        // Behavior colors
+        const behaviorColors = {
+            RESTING: '#60a5fa',
+            GRAZING: '#4ade80',
+            WALKING: '#fb923c',
+            RUNNING: '#f87171',
+        };
+
+        // Custom cow icon
+        function cowIcon(behavior) {
+            const color = behaviorColors[behavior] || '#94a3b8';
+            return L.divIcon({
+                className: '',
+                html: `<div style="
+                    width:32px;height:32px;border-radius:50%;
+                    background:${color};border:3px solid white;
+                    display:flex;align-items:center;justify-content:center;
+                    font-size:16px;box-shadow:0 2px 8px rgba(0,0,0,0.4);
+                ">&#x1F42E;</div>`,
+                iconSize: [32, 32],
+                iconAnchor: [16, 16],
+            });
+        }
+
+        // ── Socket.IO ──
+        const socket = io();
+
+        socket.on('tracker_update', (data) => {
+            updateCow(data);
+        });
+
+        socket.on('new_alert', (alert) => {
+            alertCount++;
+            addAlertToUI(alert);
+            document.getElementById('stat-alerts').textContent = alertCount;
+        });
+
+        socket.on('geofence_update', (gf) => {
+            drawGeofence(gf);
+        });
+
+        // ── Update cow on map + sidebar ──
+        function updateCow(data) {
+            const id = data.cow_id;
+            const lat = data.lat;
+            const lon = data.lon;
+
+            if (lat === 0 && lon === 0) return;
+
+            // Update or create marker
+            if (cowMarkers[id]) {
+                cowMarkers[id].setLatLng([lat, lon]);
+                cowMarkers[id].setIcon(cowIcon(data.behavior));
+            } else {
+                cowMarkers[id] = L.marker([lat, lon], { icon: cowIcon(data.behavior) })
+                    .addTo(map)
+                    .bindPopup('');
+            }
+
+            // Update popup
+            cowMarkers[id].setPopupContent(`
+                <b>Cow #${id}</b><br>
+                Behavior: ${data.behavior}<br>
+                Speed: ${data.speed?.toFixed(2) || 0} m/s<br>
+                Sats: ${data.sats}<br>
+                ${lat.toFixed(5)}, ${lon.toFixed(5)}
+            `);
+
+            // Trail
+            if (!cowTrails[id]) {
+                cowTrails[id] = L.polyline([], {
+                    color: behaviorColors[data.behavior] || '#94a3b8',
+                    weight: 2, opacity: 0.6,
+                }).addTo(map);
+            }
+            cowTrails[id].addLatLng([lat, lon]);
+            cowTrails[id].setStyle({ color: behaviorColors[data.behavior] || '#94a3b8' });
+
+            // Sidebar
+            updateCowList();
+            updateStats();
+        }
+
+        function updateCowList() {
+            const list = document.getElementById('cow-list');
+            // Get all cow data from markers
+            fetch('/api/cows').then(r => r.json()).then(cows => {
+                let html = '';
+                for (const [id, data] of Object.entries(cows)) {
+                    const sel = selectedCow == id ? 'selected' : '';
+                    html += `
+                        <div class="cow-card ${sel}" onclick="selectCow(${id})">
+                            <div class="cow-header">
+                                <span class="cow-id">Cow #${id}</span>
+                                <span class="behavior-badge behavior-${data.behavior}">${data.behavior}</span>
+                                <span class="cow-sats">${data.sats || 0} sats</span>
+                            </div>
+                            <div class="cow-speed">Speed: ${(data.speed || 0).toFixed(2)} m/s | Alt: ${(data.alt || 0).toFixed(0)}m</div>
+                            <div class="cow-coords">${(data.lat || 0).toFixed(5)}, ${(data.lon || 0).toFixed(5)}</div>
+                        </div>`;
+                }
+                list.innerHTML = html;
+                document.getElementById('cow-count').textContent = Object.keys(cows).length + ' cows';
+            });
+        }
+
+        function selectCow(id) {
+            selectedCow = id;
+            if (cowMarkers[id]) {
+                map.setView(cowMarkers[id].getLatLng(), 17);
+                cowMarkers[id].openPopup();
+            }
+            updateCowList();
+        }
+
+        function updateStats() {
+            fetch('/api/cows').then(r => r.json()).then(cows => {
+                const entries = Object.values(cows);
+                document.getElementById('stat-total').textContent = entries.length;
+                document.getElementById('stat-moving').textContent = entries.filter(c => c.behavior !== 'RESTING').length;
+                document.getElementById('stat-resting').textContent = entries.filter(c => c.behavior === 'RESTING').length;
+            });
+        }
+
+        // ── Alerts ──
+        function addAlertToUI(alert) {
+            const list = document.getElementById('alerts-list');
+            const time = new Date(alert.timestamp).toLocaleTimeString();
+            list.insertAdjacentHTML('afterbegin', `
+                <div class="alert-item ${alert.type}">
+                    <div class="alert-time">${time}</div>
+                    <div class="alert-msg">${alert.message}</div>
+                </div>
+            `);
+            // Keep max 20 alerts in DOM
+            while (list.children.length > 20) list.removeChild(list.lastChild);
+        }
+
+        // Load existing alerts
+        fetch('/api/alerts').then(r => r.json()).then(data => {
+            data.reverse().forEach(addAlertToUI);
+            alertCount = data.length;
+            document.getElementById('stat-alerts').textContent = alertCount;
+        });
+
+        // ── Geofence ──
+        function drawGeofence(gf) {
+            if (geofenceCircle) map.removeLayer(geofenceCircle);
+            if (gf.enabled) {
+                geofenceCircle = L.circle([gf.center_lat, gf.center_lon], {
+                    radius: gf.radius_m,
+                    color: '#f59e0b', fillColor: '#f59e0b',
+                    fillOpacity: 0.08, weight: 2, dashArray: '8,4',
+                }).addTo(map);
+            }
+            document.getElementById('geo-radius').value = gf.radius_m;
+            document.getElementById('geo-enabled').checked = gf.enabled;
+        }
+
+        function updateGeofence() {
+            const radius = parseInt(document.getElementById('geo-radius').value);
+            const enabled = document.getElementById('geo-enabled').checked;
+            fetch('/api/geofence', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ radius_m: radius, enabled: enabled }),
+            });
+        }
+
+        // Load initial geofence
+        fetch('/api/geofence').then(r => r.json()).then(drawGeofence);
+
+        // ── Clock ──
+        setInterval(() => {
+            document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+        }, 1000);
+
+        // Initial data load
+        fetch('/api/cows').then(r => r.json()).then(cows => {
+            for (const [id, data] of Object.entries(cows)) {
+                updateCow(data);
+            }
+            if (Object.keys(cows).length > 0) {
+                const first = Object.values(cows)[0];
+                if (first.lat) map.setView([first.lat, first.lon], 16);
+            }
+        });
+
+        // Refresh cow list periodically
+        setInterval(updateCowList, 3000);
+    </script>
+</body>
+</html>

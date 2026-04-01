@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_check.h"
 #include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -22,12 +23,17 @@ static const char *TAG = "tracker";
 #define I2C_SCL_PIN         7
 #define MPU6050_ADDR        0x68
 
-#define LORA_SCK_PIN        18
-#define LORA_MISO_PIN       19
-#define LORA_MOSI_PIN       20
-#define LORA_CS_PIN         21
-#define LORA_RST_PIN        22
-#define LORA_DIO0_PIN       23
+#define RF_SCK_PIN          18
+#define RF_MISO_PIN         19
+#define RF_MOSI_PIN         20
+#define RF_CS_PIN           21
+#define RF_RST_PIN          22
+#define RF_DIO0_PIN         23
+
+/* Must match gateway */
+#define RF_NETWORK_ID       100
+#define RF_NODE_ID          1
+#define RF_GATEWAY_ID       0
 
 /* ── Behavior States ── */
 typedef enum {
@@ -52,24 +58,67 @@ static bool g_gps_fix = false;
 static behavior_t g_behavior = BEHAVIOR_RESTING;
 static float g_accel_variance = 0.0f;
 static i2c_master_dev_handle_t mpu6050_handle = NULL;
-static spi_device_handle_t lora_spi = NULL;
-static bool g_lora_ok = false;
+static spi_device_handle_t rf_spi = NULL;
+static bool g_rf_ok = false;
 
 /* ══════════════════════════════════════════
-   LoRa (RFM9x / SX1276) SPI Driver
+   SX1276 FSK Mode Driver
+   Register map is DIFFERENT from RFM69!
+   Configured to be compatible with RFM69 gateway.
    ══════════════════════════════════════════ */
 
-static esp_err_t lora_write_reg(uint8_t reg, uint8_t val)
+/* SX1276 FSK register addresses */
+#define SX_REG_FIFO          0x00
+#define SX_REG_OPMODE        0x01
+#define SX_REG_BITRATEMSB    0x02
+#define SX_REG_BITRATELSB    0x03
+#define SX_REG_FDEVMSB       0x04
+#define SX_REG_FDEVLSB       0x05
+#define SX_REG_FRFMSB        0x06
+#define SX_REG_FRFMID        0x07
+#define SX_REG_FRFLSB        0x08
+#define SX_REG_PACONFIG      0x09
+#define SX_REG_PARAMP        0x0A
+#define SX_REG_OCP           0x0B
+#define SX_REG_IRQFLAGS1     0x3E
+#define SX_REG_IRQFLAGS2     0x3F
+#define SX_REG_PREAMBLEMSB   0x25
+#define SX_REG_PREAMBLELSB   0x26
+#define SX_REG_SYNCCONFIG    0x27
+#define SX_REG_SYNCVALUE1    0x28
+#define SX_REG_SYNCVALUE2    0x29
+#define SX_REG_PACKETCONFIG1 0x30
+#define SX_REG_PACKETCONFIG2 0x31
+#define SX_REG_PAYLOADLEN    0x32
+#define SX_REG_NODEADRS      0x33
+#define SX_REG_FIFOTHRESH    0x35
+#define SX_REG_VERSION       0x42
+
+/* SX1276 OpMode register bits:
+ * bit7: LongRangeMode (0=FSK, 1=LoRa)
+ * bit6:5: ModulationType (00=FSK)
+ * bit4: reserved
+ * bit3: LowFrequencyModeOn (0=high freq, for 915MHz)
+ * bit2:0: Mode (000=sleep, 001=standby, 010=FS TX, 011=TX, 100=FS RX, 101=RX)
+ */
+#define SX_MODE_SLEEP     0x00
+#define SX_MODE_STANDBY   0x01
+#define SX_MODE_FSTX      0x02
+#define SX_MODE_TX        0x03
+#define SX_MODE_FSRX      0x04
+#define SX_MODE_RX        0x05
+
+static esp_err_t rf_write_reg(uint8_t reg, uint8_t val)
 {
     spi_transaction_t t = {
         .length = 16,
         .tx_data = { (uint8_t)(reg | 0x80), val },
         .flags = SPI_TRANS_USE_TXDATA,
     };
-    return spi_device_transmit(lora_spi, &t);
+    return spi_device_transmit(rf_spi, &t);
 }
 
-static uint8_t lora_read_reg(uint8_t reg)
+static uint8_t rf_read_reg(uint8_t reg)
 {
     spi_transaction_t t = {
         .length = 16,
@@ -77,114 +126,183 @@ static uint8_t lora_read_reg(uint8_t reg)
         .rx_data = { 0 },
         .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA,
     };
-    spi_device_transmit(lora_spi, &t);
+    spi_device_transmit(rf_spi, &t);
     return t.rx_data[1];
 }
 
-static esp_err_t lora_init(void)
+static void rf_set_mode(uint8_t mode)
 {
-    /* Reset the module */
+    /* SX1276 OpMode register: bits [2:0] = mode, keep FSK (bit7=0, bits6:5=00) */
+    rf_write_reg(SX_REG_OPMODE, mode);
+    /* Wait for ModeReady (bit7 of IrqFlags1) */
+    int timeout = 100;
+    while (timeout-- > 0) {
+        if (rf_read_reg(SX_REG_IRQFLAGS1) & 0x80) return;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    ESP_LOGW(TAG, "Mode change timeout (mode=0x%02X)", mode);
+}
+
+static esp_err_t rf_init(void)
+{
+    /* Reset */
     gpio_config_t rst_conf = {
-        .pin_bit_mask = (1ULL << LORA_RST_PIN),
+        .pin_bit_mask = (1ULL << RF_RST_PIN),
         .mode = GPIO_MODE_OUTPUT,
     };
     gpio_config(&rst_conf);
-    gpio_set_level(LORA_RST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(LORA_RST_PIN, 1);
+    gpio_set_level(RF_RST_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    gpio_set_level(RF_RST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    gpio_set_level(RF_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* SPI bus config */
+    /* SPI */
     spi_bus_config_t bus_cfg = {
-        .mosi_io_num = LORA_MOSI_PIN,
-        .miso_io_num = LORA_MISO_PIN,
-        .sclk_io_num = LORA_SCK_PIN,
+        .mosi_io_num = RF_MOSI_PIN,
+        .miso_io_num = RF_MISO_PIN,
+        .sclk_io_num = RF_SCK_PIN,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 256,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_DISABLED), TAG, "SPI bus init failed");
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_DISABLED), TAG, "SPI init failed");
 
     spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = 1000000,  /* 1 MHz */
+        .clock_speed_hz = 1000000,
         .mode = 0,
-        .spics_io_num = LORA_CS_PIN,
+        .spics_io_num = RF_CS_PIN,
         .queue_size = 1,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_add_device(SPI2_HOST, &dev_cfg, &lora_spi), TAG, "SPI device add failed");
+    ESP_RETURN_ON_ERROR(spi_bus_add_device(SPI2_HOST, &dev_cfg, &rf_spi), TAG, "SPI device add failed");
 
-    /* Check version register — SX1276 should return 0x12 */
-    uint8_t version = lora_read_reg(0x42);
-    ESP_LOGI(TAG, "LoRa version register: 0x%02X (expected 0x12 for SX1276)", version);
-
+    /* Verify SX1276 */
+    uint8_t version = rf_read_reg(SX_REG_VERSION);
+    ESP_LOGI(TAG, "SX1276 version: 0x%02X (expected 0x12)", version);
     if (version != 0x12) {
-        ESP_LOGE(TAG, "LoRa NOT detected! Check wiring:");
-        ESP_LOGE(TAG, "  SCK  -> GPIO%d", LORA_SCK_PIN);
-        ESP_LOGE(TAG, "  MISO -> GPIO%d", LORA_MISO_PIN);
-        ESP_LOGE(TAG, "  MOSI -> GPIO%d", LORA_MOSI_PIN);
-        ESP_LOGE(TAG, "  CS   -> GPIO%d", LORA_CS_PIN);
-        ESP_LOGE(TAG, "  RST  -> GPIO%d", LORA_RST_PIN);
-        ESP_LOGE(TAG, "  VIN  -> 3.3V, GND -> GND");
+        ESP_LOGE(TAG, "SX1276 not detected! Check wiring.");
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "SX1276 detected!");
 
-    ESP_LOGI(TAG, "LoRa SX1276 detected!");
+    /* Set Sleep mode first to switch to FSK */
+    rf_write_reg(SX_REG_OPMODE, SX_MODE_SLEEP);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* Set sleep mode */
-    lora_write_reg(0x01, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(15));
+    /* FSK mode, Sleep — bit7=0 (FSK), bits6:5=00 (FSK modulation), bits2:0=000 (sleep) */
+    rf_write_reg(SX_REG_OPMODE, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* Set LoRa mode */
-    lora_write_reg(0x01, 0x80);
-    vTaskDelay(pdMS_TO_TICKS(15));
+    /* Standby */
+    rf_set_mode(SX_MODE_STANDBY);
 
-    /* Set frequency — 915 MHz (0xE4C000) */
-    /* Change to 433 MHz (0x6C8000) if your module is 433 */
-    lora_write_reg(0x06, 0xE4);
-    lora_write_reg(0x07, 0xC0);
-    lora_write_reg(0x08, 0x00);
+    /* Bitrate: 4800 bps — FXOSC(32MHz) / 4800 = 6667 = 0x1A0B */
+    rf_write_reg(SX_REG_BITRATEMSB, 0x1A);
+    rf_write_reg(SX_REG_BITRATELSB, 0x0B);
 
-    /* Set bandwidth 125kHz, coding rate 4/5, explicit header */
-    lora_write_reg(0x1D, 0x72);
-    /* Spreading factor 7, CRC on */
-    lora_write_reg(0x1E, 0x74);
-    /* Set TX power to 17 dBm */
-    lora_write_reg(0x09, 0x8F);
+    /* Frequency deviation: 5 kHz — 5000 / FSTEP(61.035) = 82 = 0x0052 */
+    rf_write_reg(SX_REG_FDEVMSB, 0x00);
+    rf_write_reg(SX_REG_FDEVLSB, 0x52);
 
-    /* Standby mode */
-    lora_write_reg(0x01, 0x81);
+    /* Frequency: 915 MHz — 915000000 / FSTEP(61.035) = 14991360 = 0xE4C000 */
+    rf_write_reg(SX_REG_FRFMSB, 0xE4);
+    rf_write_reg(SX_REG_FRFMID, 0xC0);
+    rf_write_reg(SX_REG_FRFLSB, 0x00);
 
-    ESP_LOGI(TAG, "LoRa configured: 915MHz, SF7, BW125kHz, 17dBm");
+    /* PA config: PA_BOOST pin (bit7=1), MaxPower=7 (bits6:4), OutputPower=15 (bits3:0) = +17dBm */
+    rf_write_reg(SX_REG_PACONFIG, 0xFF);
+    /* PA ramp time: 40us */
+    rf_write_reg(SX_REG_PARAMP, 0x09);
+    /* OCP: enable, 100mA */
+    rf_write_reg(SX_REG_OCP, 0x2B);
+
+    /* RegDioMapping1 (0x40): DIO0=PacketSent in TX mode */
+    rf_write_reg(0x40, 0x00);
+    /* RegDioMapping2 (0x41): default */
+    rf_write_reg(0x41, 0x00);
+
+    /* Preamble: 3 bytes (RFM69 default) */
+    rf_write_reg(SX_REG_PREAMBLEMSB, 0x00);
+    rf_write_reg(SX_REG_PREAMBLELSB, 0x03);
+
+    /* Sync config: sync on, 2 bytes sync word — matches RFM69 */
+    rf_write_reg(SX_REG_SYNCCONFIG, 0x91); /* AutoRestartRx=on, SyncOn=1, SyncSize=1 (2 bytes) */
+    rf_write_reg(SX_REG_SYNCVALUE1, 0x2D); /* Must match RFM69 */
+    rf_write_reg(SX_REG_SYNCVALUE2, RF_NETWORK_ID);
+
+    /* Packet config1: variable length (bit7=1), CRC on (bit4=1) */
+    rf_write_reg(SX_REG_PACKETCONFIG1, 0x90);
+    /* Packet config2: DataMode=Packet (bit6=1), also try enabling sequencer */
+    rf_write_reg(SX_REG_PACKETCONFIG2, 0x40);
+    /* RegSeqConfig1 (0x36): enable sequencer for auto TX */
+    /* RegImageCal (0x3B): auto image cal */
+    /* Max payload length */
+    rf_write_reg(SX_REG_PAYLOADLEN, 66);
+    rf_write_reg(SX_REG_NODEADRS, RF_NODE_ID);
+
+    /* FIFO threshold: TxStartCondition=FifoNotEmpty (bit7=1), threshold=15 */
+    rf_write_reg(SX_REG_FIFOTHRESH, 0x8F);
+
+    /* Verify key registers */
+    ESP_LOGI(TAG, "  OpMode=0x%02X BitRate=0x%02X%02X Fdev=0x%02X%02X",
+             rf_read_reg(SX_REG_OPMODE),
+             rf_read_reg(SX_REG_BITRATEMSB), rf_read_reg(SX_REG_BITRATELSB),
+             rf_read_reg(SX_REG_FDEVMSB), rf_read_reg(SX_REG_FDEVLSB));
+    ESP_LOGI(TAG, "  Frf=0x%02X%02X%02X Sync=0x%02X%02X PktCfg1=0x%02X PktCfg2=0x%02X",
+             rf_read_reg(SX_REG_FRFMSB), rf_read_reg(SX_REG_FRFMID), rf_read_reg(SX_REG_FRFLSB),
+             rf_read_reg(SX_REG_SYNCVALUE1), rf_read_reg(SX_REG_SYNCVALUE2),
+             rf_read_reg(SX_REG_PACKETCONFIG1), rf_read_reg(SX_REG_PACKETCONFIG2));
+
+    /* Back to standby */
+    rf_set_mode(SX_MODE_STANDBY);
+
+    ESP_LOGI(TAG, "SX1276 FSK configured: 915MHz, 4800bps, Network:%d, Node:%d", RF_NETWORK_ID, RF_NODE_ID);
     return ESP_OK;
 }
 
-static esp_err_t lora_send(const uint8_t *data, size_t len)
+static esp_err_t rf_send(const uint8_t *data, size_t len)
 {
-    /* Set standby */
-    lora_write_reg(0x01, 0x81);
-    /* Set FIFO pointer to base */
-    lora_write_reg(0x0D, 0x00);
-    lora_write_reg(0x0E, 0x00);
-    /* Write data to FIFO */
+    if (len > 61) len = 61;
+
+    /* Sleep to reset state machine */
+    rf_write_reg(SX_REG_OPMODE, SX_MODE_SLEEP);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    /* FSK standby */
+    rf_write_reg(SX_REG_OPMODE, SX_MODE_STANDBY);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    /* Clear FIFO: set FifoOverrun bit to flush */
+    rf_write_reg(SX_REG_IRQFLAGS2, 0x10);
+
+    /* Write packet to FIFO one byte at a time */
+    rf_write_reg(SX_REG_FIFO, (uint8_t)(len + 3));  /* Length */
+    rf_write_reg(SX_REG_FIFO, RF_GATEWAY_ID);        /* Target */
+    rf_write_reg(SX_REG_FIFO, RF_NODE_ID);            /* Sender */
+    rf_write_reg(SX_REG_FIFO, 0x00);                  /* Control */
     for (size_t i = 0; i < len; i++) {
-        lora_write_reg(0x00, data[i]);
+        rf_write_reg(SX_REG_FIFO, data[i]);
     }
-    /* Set payload length */
-    lora_write_reg(0x22, (uint8_t)len);
-    /* Set TX mode */
-    lora_write_reg(0x01, 0x83);
-    /* Wait for TX done (IRQ flag bit 3) */
-    int timeout = 200;
+
+    /* Enter TX */
+    rf_write_reg(SX_REG_OPMODE, SX_MODE_TX);
+
+    /* Wait for PacketSent (bit3 of IrqFlags2 at 0x3F) */
+    int timeout = 50;
     while (timeout-- > 0) {
-        uint8_t irq = lora_read_reg(0x12);
-        if (irq & 0x08) {
-            /* Clear IRQ */
-            lora_write_reg(0x12, 0xFF);
+        uint8_t f2 = rf_read_reg(SX_REG_IRQFLAGS2);
+        if (f2 & 0x08) { /* PacketSent */
+            rf_write_reg(SX_REG_OPMODE, SX_MODE_STANDBY);
             return ESP_OK;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    ESP_LOGW(TAG, "LoRa TX timeout");
+
+    uint8_t om = rf_read_reg(SX_REG_OPMODE);
+    ESP_LOGW(TAG, "TX timeout (f1=0x%02X f2=0x%02X opmode=0x%02X)",
+             rf_read_reg(SX_REG_IRQFLAGS1), rf_read_reg(SX_REG_IRQFLAGS2), om);
+    rf_write_reg(SX_REG_OPMODE, SX_MODE_STANDBY);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -308,30 +426,33 @@ static void report_task(void *arg)
             char json[256];
             if (g_gps_fix) {
                 snprintf(json, sizeof(json),
-                    "{\"cow_id\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,"
-                    "\"speed\":%.2f,\"sats\":%d,"
-                    "\"behavior\":\"%s\",\"accel_var\":%.4f,"
-                    "\"time\":\"%02d:%02d:%02d\",\"date\":\"%04d-%02d-%02d\"}",
+                    "{\"id\":%d,\"la\":%.6f,\"lo\":%.6f,\"al\":%.1f,"
+                    "\"sp\":%.2f,\"sa\":%d,"
+                    "\"bh\":\"%s\",\"av\":%.4f,"
+                    "\"t\":\"%02d:%02d:%02d\"}",
+                    RF_NODE_ID,
                     g_gps_data.latitude, g_gps_data.longitude, g_gps_data.altitude,
                     g_gps_data.speed, g_gps_data.sats_in_use,
                     behavior_str[g_behavior], g_accel_variance,
-                    g_gps_data.tim.hour, g_gps_data.tim.minute, g_gps_data.tim.second,
-                    g_gps_data.date.year + 2000, g_gps_data.date.month, g_gps_data.date.day);
+                    g_gps_data.tim.hour, g_gps_data.tim.minute, g_gps_data.tim.second);
             } else {
                 snprintf(json, sizeof(json),
-                    "{\"cow_id\":1,\"lat\":0,\"lon\":0,\"alt\":0,"
-                    "\"speed\":0,\"sats\":0,"
-                    "\"behavior\":\"%s\",\"accel_var\":%.4f}",
+                    "{\"id\":%d,\"la\":0,\"lo\":0,\"al\":0,"
+                    "\"sp\":0,\"sa\":0,"
+                    "\"bh\":\"%s\",\"av\":%.4f}",
+                    RF_NODE_ID,
                     behavior_str[g_behavior], g_accel_variance);
             }
 
             /* Print to serial */
             printf("%s\n", json);
 
-            /* Send via LoRa if available */
-            if (g_lora_ok) {
-                if (lora_send((uint8_t *)json, strlen(json)) == ESP_OK) {
-                    ESP_LOGI(TAG, "LoRa TX OK (%d bytes)", strlen(json));
+            /* Send via radio */
+            if (g_rf_ok) {
+                if (rf_send((uint8_t *)json, strlen(json)) == ESP_OK) {
+                    ESP_LOGI(TAG, "RF TX OK (%d bytes)", strlen(json));
+                } else {
+                    ESP_LOGW(TAG, "RF TX failed");
                 }
             }
 
@@ -348,8 +469,8 @@ static void report_task(void *arg)
 /* ── App Main ── */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Cow GPS Tracker v1.1 ===");
-    ESP_LOGI(TAG, "GPS + Accel + LoRa");
+    ESP_LOGI(TAG, "=== Cow GPS Tracker v1.3 ===");
+    ESP_LOGI(TAG, "GPS + Accel + SX1276-FSK");
 
     /* Start GPS */
     nmea_parser_config_t gps_config = {
@@ -369,8 +490,8 @@ void app_main(void)
         ESP_LOGI(TAG, "GPS started on GPIO%d", GPS_UART_RX_PIN);
     }
 
-    /* Start LoRa */
-    g_lora_ok = (lora_init() == ESP_OK);
+    /* Start radio */
+    g_rf_ok = (rf_init() == ESP_OK);
 
     /* Start accelerometer */
     xTaskCreate(accel_task, "accel", 4096, NULL, 5, NULL);

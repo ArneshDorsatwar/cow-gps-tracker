@@ -90,6 +90,15 @@ def process_tracker_update(data):
 
 
 # ── Serial reader (reads JSON from ESP32 USB) ──
+def expand_short_keys(data):
+    """Expand shortened JSON keys from the collar firmware."""
+    key_map = {
+        "id": "cow_id", "la": "lat", "lo": "lon", "al": "alt",
+        "sp": "speed", "sa": "sats", "bh": "behavior", "av": "accel_var", "t": "time",
+    }
+    return {key_map.get(k, k): v for k, v in data.items()}
+
+
 def serial_reader(port, baud=115200):
     try:
         import serial
@@ -102,6 +111,7 @@ def serial_reader(port, baud=115200):
                     text = line.decode("utf-8", errors="replace").strip()
                     if text.startswith("{"):
                         data = json.loads(text)
+                        data = expand_short_keys(data)
                         process_tracker_update(data)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass

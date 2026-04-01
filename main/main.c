@@ -3,14 +3,9 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_http_client.h"
-#include "nvs_flash.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -18,11 +13,6 @@
 #include "nmea_parser.h"
 
 static const char *TAG = "tracker";
-
-/* ── Wi-Fi Config ── */
-#define WIFI_SSID       "GTother"
-#define WIFI_PASS       "GeorgeP@1927"
-#define DASHBOARD_URL   "http://143.215.190.84:5000/api/data"
 
 /* ── Pin Definitions ── */
 #define GPS_UART_RX_PIN     5
@@ -137,10 +127,10 @@ static esp_err_t rf_init(void)
     rf_write_reg(REG_BITRATEMSB, 0x1A); rf_write_reg(REG_BITRATELSB, 0x0B);
     rf_write_reg(REG_FDEVMSB, 0x00); rf_write_reg(REG_FDEVLSB, 0x52);
     rf_write_reg(REG_FRFMSB, 0xE4); rf_write_reg(REG_FRFMID, 0xC0); rf_write_reg(REG_FRFLSB, 0x00);
-    rf_write_reg(REG_RXBW, 0x55); rf_write_reg(REG_AFCBW, 0x55);
+    rf_write_reg(REG_RXBW, 0x42); rf_write_reg(REG_AFCBW, 0x42);
     rf_write_reg(REG_SYNCCONFIG, 0x88);
     rf_write_reg(REG_SYNCVALUE1, 0x2D); rf_write_reg(REG_SYNCVALUE2, RF_NETWORK_ID);
-    rf_write_reg(REG_PACKETCONFIG1, 0x90);
+    rf_write_reg(REG_PACKETCONFIG1, 0x90); /* Variable length, CRC ON */
     rf_write_reg(REG_PAYLOADLEN, 66);
     rf_write_reg(REG_NODEADRS, RF_NODE_ID);
     rf_write_reg(REG_FIFOTHRESH, 0x8F);
@@ -198,72 +188,6 @@ static esp_err_t rf_send(const uint8_t *data, size_t len)
     ESP_LOGW(TAG, "RF TX timeout");
     rf_set_mode(MODE_STANDBY);
     return ESP_ERR_TIMEOUT;
-}
-
-/* ══════════════════════════════════════════
-   Wi-Fi + HTTP
-   ══════════════════════════════════════════ */
-
-static EventGroupHandle_t wifi_events;
-#define WIFI_CONNECTED_BIT BIT0
-static bool wifi_connected = false;
-
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) { wifi_connected = false; esp_wifi_connect(); }
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "Wi-Fi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        wifi_connected = true;
-        xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_init(void)
-{
-    wifi_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Connecting to Wi-Fi '%s'...", WIFI_SSID);
-    xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, false, true, pdMS_TO_TICKS(10000));
-}
-
-static void wifi_post(const char *short_json)
-{
-    if (!wifi_connected) return;
-    char expanded[512]; char *p = expanded; const char *s = short_json;
-    while (*s && (p - expanded) < (int)sizeof(expanded) - 50) {
-        if (strncmp(s, "\"id\"", 4) == 0) { memcpy(p, "\"cow_id\"", 8); p += 8; s += 4; }
-        else if (strncmp(s, "\"la\"", 4) == 0) { memcpy(p, "\"lat\"", 5); p += 5; s += 4; }
-        else if (strncmp(s, "\"lo\"", 4) == 0) { memcpy(p, "\"lon\"", 5); p += 5; s += 4; }
-        else if (strncmp(s, "\"al\"", 4) == 0) { memcpy(p, "\"alt\"", 5); p += 5; s += 4; }
-        else if (strncmp(s, "\"sp\"", 4) == 0) { memcpy(p, "\"speed\"", 7); p += 7; s += 4; }
-        else if (strncmp(s, "\"sa\"", 4) == 0) { memcpy(p, "\"sats\"", 6); p += 6; s += 4; }
-        else if (strncmp(s, "\"bh\"", 4) == 0) { memcpy(p, "\"behavior\"", 10); p += 10; s += 4; }
-        else if (strncmp(s, "\"av\"", 4) == 0) { memcpy(p, "\"accel_var\"", 11); p += 11; s += 4; }
-        else if (strncmp(s, "\"t\"", 3) == 0) { memcpy(p, "\"time\"", 6); p += 6; s += 3; }
-        else { *p++ = *s++; }
-    }
-    *p = '\0';
-
-    esp_http_client_config_t config = { .url = DASHBOARD_URL, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, expanded, strlen(expanded));
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) ESP_LOGI(TAG, "Wi-Fi POST OK (HTTP %d)", esp_http_client_get_status_code(client));
-    else ESP_LOGW(TAG, "Wi-Fi POST failed: %s", esp_err_to_name(err));
-    esp_http_client_cleanup(client);
 }
 
 /* ══════════════════════════════════════════
@@ -346,10 +270,10 @@ static void report_task(void *arg)
                 snprintf(json, sizeof(json), "{\"id\":%d,\"la\":0,\"lo\":0,\"al\":0,\"sp\":0,\"sa\":0,\"bh\":\"%s\",\"av\":%.4f}",
                     RF_NODE_ID, behavior_str[g_behavior], g_accel_variance);
 
-            /* Print full JSON to serial for debugging */
+            /* Print to serial for debugging */
             printf("%s\n", json);
 
-            /* Send compact CSV over radio (fits in 61 byte FIFO limit) */
+            /* Send compact CSV over radio ONLY — no Wi-Fi needed on collar */
             /* Format: id,lat,lon,alt,speed,sats,behavior_char,accel_var */
             if (g_rf_ok) {
                 char csv[60];
@@ -377,30 +301,16 @@ static void report_task(void *arg)
 /* ── App Main ── */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Cow GPS Tracker v2.0 ===");
-    ESP_LOGI(TAG, "GPS + Accel + RFM69 + Wi-Fi");
+    ESP_LOGI(TAG, "=== Cow GPS Tracker v2.1 ===");
+    ESP_LOGI(TAG, "GPS + Accel + RFM69 (Radio Only)");
 
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); nvs_flash_init(); }
-
-    /* Init radio FIRST before Wi-Fi */
+    /* Init radio */
     g_rf_ok = (rf_init() == ESP_OK);
 
-    wifi_init();
-
+    /* Init GPS */
     nmea_parser_config_t gps_config = { .uart = { .uart_port = GPS_UART_NUM, .rx_pin = GPS_UART_RX_PIN, .baud_rate = GPS_UART_BAUD, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .event_queue_size = 16 } };
     nmea_parser_handle_t nmea_hdl = nmea_parser_init(&gps_config);
     if (nmea_hdl) { nmea_parser_add_handler(nmea_hdl, gps_event_handler, NULL); ESP_LOGI(TAG, "GPS started on GPIO%d", GPS_UART_RX_PIN); }
-
-    /* Re-verify radio after Wi-Fi */
-    if (g_rf_ok) {
-        uint8_t v = rf_read_reg(REG_VERSION);
-        ESP_LOGI(TAG, "RFM69 post-WiFi check: version=0x%02X", v);
-        if (v != 0x24) {
-            ESP_LOGW(TAG, "RFM69 lost after Wi-Fi init! Re-initializing...");
-            g_rf_ok = (rf_init() == ESP_OK);
-        }
-    }
 
     xTaskCreate(accel_task, "accel", 4096, NULL, 5, NULL);
     xTaskCreate(report_task, "report", 4096, NULL, 3, NULL);

@@ -346,11 +346,27 @@ static void report_task(void *arg)
                 snprintf(json, sizeof(json), "{\"id\":%d,\"la\":0,\"lo\":0,\"al\":0,\"sp\":0,\"sa\":0,\"bh\":\"%s\",\"av\":%.4f}",
                     RF_NODE_ID, behavior_str[g_behavior], g_accel_variance);
 
+            /* Print full JSON to serial for debugging */
             printf("%s\n", json);
-            wifi_post(json);
+
+            /* Send compact CSV over radio (fits in 61 byte FIFO limit) */
+            /* Format: id,lat,lon,alt,speed,sats,behavior_char,accel_var */
             if (g_rf_ok) {
-                if (rf_send((uint8_t *)json, strlen(json)) == ESP_OK) ESP_LOGI(TAG, "RF TX OK (%d bytes)", strlen(json));
-                else ESP_LOGW(TAG, "RF TX failed");
+                char csv[60];
+                char bh = behavior_str[g_behavior][0]; /* R, G, W, or R */
+                if (g_gps_fix)
+                    snprintf(csv, sizeof(csv), "%d,%.4f,%.4f,%.0f,%.1f,%d,%c,%.2f",
+                        RF_NODE_ID, g_gps_data.latitude, g_gps_data.longitude,
+                        g_gps_data.altitude, g_gps_data.speed,
+                        g_gps_data.sats_in_use, bh, g_accel_variance);
+                else
+                    snprintf(csv, sizeof(csv), "%d,0,0,0,0,0,%c,%.2f",
+                        RF_NODE_ID, bh, g_accel_variance);
+
+                if (rf_send((uint8_t *)csv, strlen(csv)) == ESP_OK)
+                    ESP_LOGI(TAG, "RF TX OK (%d bytes): %s", strlen(csv), csv);
+                else
+                    ESP_LOGW(TAG, "RF TX failed");
             }
             ESP_LOGI(TAG, "[%s] Lat:%.5f Lon:%.5f Sats:%d", behavior_str[g_behavior], g_gps_data.latitude, g_gps_data.longitude, g_gps_data.sats_in_use);
         }

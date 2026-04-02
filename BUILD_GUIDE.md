@@ -52,6 +52,38 @@ real-time web dashboard with a map, geofencing, and alerts.
 
 ---
 
+## Project Photos
+
+### Full System Overview
+![Full System](images/full_system.jpg)
+*Complete system: collar (left) with battery pack and GPS, gateway (right) connected to laptop*
+
+### Collar Unit
+![Collar with Battery](images/collar_with_battery.jpg)
+*Collar unit: ESP32-C6 + RFM69HCW radio + GP-20U7 GPS module, powered by AA battery pack through MPM3610 regulator*
+
+### Collar Close-up
+![Collar Closeup](images/collar_closeup.jpg)
+*Close-up of the collar breadboard showing ESP32-C6 and RFM69HCW radio module with wire antenna*
+
+### Gateway Unit
+![Gateway Breadboard](images/gateway_breadboard.jpg)
+*Gateway: ESP32-C6 + RFM69HCW radio, connected to laptop via USB. Receives radio packets and forwards to dashboard*
+
+### Gateway Close-up
+![Gateway Closeup](images/gateway_closeup.jpg)
+*Close-up of gateway showing RFM69HCW radio module with SPI wiring and wire antenna*
+
+### MPM3610 Voltage Regulator
+![MPM3610](images/mpm3610_regulator.jpg)
+*MPM3610 buck converter: steps down battery voltage to 3.3V for the collar electronics*
+
+### Battery Pack
+![Battery](images/battery_closeup.jpg)
+*AA battery pack with ON/OFF switch, connected to MPM3610 regulator via jumper wires*
+
+---
+
 ## 2. System Architecture
 
 ```

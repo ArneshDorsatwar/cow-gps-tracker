@@ -39,7 +39,7 @@ typedef enum {
     BEHAVIOR_RESTING, BEHAVIOR_GRAZING, BEHAVIOR_WALKING, BEHAVIOR_RUNNING,
 } behavior_t;
 static const char *behavior_str[] = {"RESTING", "GRAZING", "WALKING", "RUNNING"};
-static const uint32_t gps_interval_ms[] = { 60000, 20000, 5000, 1000 };
+static const uint32_t gps_interval_ms[] = { 10000, 5000, 3000, 1000 };
 
 /* ── Global State ── */
 static gps_t g_gps_data;
